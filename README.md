@@ -1,4 +1,4 @@
-# CIGMA: Causal Invariant Graph Matching with Multi-View Distillation for Predicting Herb-Symptom Associations and Mechanisms of Action
+# CIGMA: Causal-inspired Invariant Graph Matching with Multi-View Distillation for Predicting Herb-Symptom Associations
 <img width="2052" height="937" alt="image" src="https://github.com/user-attachments/assets/8fedd16e-c1f3-4e84-b3ed-e3a9853e58da" />
 
 
