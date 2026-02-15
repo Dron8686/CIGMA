@@ -10,6 +10,7 @@ import os
 from torch.utils.data import DataLoader, TensorDataset, Subset, random_split
 import warnings
 import math
+from collections import Counter
 
 warnings.filterwarnings("ignore")
 
@@ -108,7 +109,6 @@ def evaluate_model(model, data_loader, feature_index, drug_neighbor_set, symptom
 
 if __name__ == '__main__':
     args = args_parser()
-    # --- 再现性设置 ---
     random.seed(args.seed);
     torch.manual_seed(args.seed);
     torch.cuda.manual_seed_all(args.seed)
@@ -148,11 +148,11 @@ if __name__ == '__main__':
 
     print(f"\nStarting Causal Invariant Fine-tuning for 5 Folds in {args.save_dir}...")
 
-    FINETUNE_EPOCHS = 50
-    LEARNING_RATE = 0.0001
-    IRM_LAMBDA = 0.5
+    FINETUNE_EPOCHS = 30
+    LEARNING_RATE = 5e-6
+    IRM_LAMBDA = 1e-4
     VALIDATION_SPLIT = 0.1
-    PATIENCE = 10
+    PATIENCE = 30
 
     final_model_paths_for_folds = []
 
@@ -225,10 +225,35 @@ if __name__ == '__main__':
             final_model_paths_for_folds.append(model_path)
             continue
 
-        env_indices = list(range(len(train_subset)))
-        random.shuffle(env_indices)
-        split_point = len(env_indices) // 2
-        env1_indices, env2_indices = env_indices[:split_point], env_indices[split_point:]
+
+        print(f"Fold {fold_id}: Generating environments based on Node Degree (Popularity)...")
+
+        temp_loader = DataLoader(train_subset, batch_size=len(train_subset), shuffle=False)
+        all_data_tensor, _ = next(iter(temp_loader))
+
+        train_drug_indices = all_data_tensor[:, feature_index['drug']].cpu().numpy()
+        train_symptom_indices = all_data_tensor[:, feature_index['symptom']].cpu().numpy()
+
+        drug_counts = Counter(train_drug_indices)
+        sym_counts = Counter(train_symptom_indices)
+
+        sample_scores = []
+        for i in range(len(train_drug_indices)):
+            d_id = train_drug_indices[i]
+            s_id = train_symptom_indices[i]
+            score = drug_counts[d_id] + sym_counts[s_id]
+            sample_scores.append(score)
+
+        sample_scores = np.array(sample_scores)
+
+        sorted_indices_local = np.argsort(sample_scores)
+        split_point = len(sorted_indices_local) // 2
+
+        env1_indices = sorted_indices_local[:split_point].tolist()
+        env2_indices = sorted_indices_local[split_point:].tolist()
+
+        print(f"Fold {fold_id}: Degree-based Split Successful - Env1: {len(env1_indices)}, Env2: {len(env2_indices)}")
+
 
         if not env1_indices or not env2_indices:
             print(f"Warning: Could not create two non-empty IRM envs for fold {fold_id}. Skipping fine-tuning.")
@@ -237,8 +262,6 @@ if __name__ == '__main__':
 
         env1_loader = DataLoader(Subset(train_subset, env1_indices), batch_size=BATCH_SIZE, shuffle=True)
         env2_loader = DataLoader(Subset(train_subset, env2_indices), batch_size=BATCH_SIZE, shuffle=True)
-        print(
-            f"Fold {fold_id}: Created {len(train_subset)} training, {len(val_subset)} validation, {len(env1_indices)}/{len(env2_indices)} IRM envs.")
 
         optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
         loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -250,8 +273,10 @@ if __name__ == '__main__':
         print(
             f"Fold {fold_id} Baseline on new val set: AUPR={metrics_valid_baseline[0]:.4f}, AUC={metrics_valid_baseline[1]:.4f}")
 
-        fine_tuning_successful = False
-        causal_model_path_fold = os.path.join(args.save_dir, f'best_model_DELTA_GA_fold_{fold_id}.pth')
+        optimized_model_path_fold = os.path.join(args.save_dir, f'best_model_DELTA_GA_optimized_fold_{fold_id}.pth')
+        force_save_path_fold = os.path.join(args.save_dir, f'best_model_DELTA_GA_forced_fold_{fold_id}.pth')
+
+        if os.path.exists(optimized_model_path_fold): os.remove(optimized_model_path_fold)
 
         for epoch in range(1, FINETUNE_EPOCHS + 1):
             model.train()
@@ -312,27 +337,35 @@ if __name__ == '__main__':
             if current_valid_metric > best_valid_metric:
                 best_valid_metric = current_valid_metric
                 try:
-                    torch.save(model.state_dict(), causal_model_path_fold)
-                    print(
-                        f"  -> Fold {fold_id} model improved to {best_valid_metric:.4f}. Model saved.")
-                    fine_tuning_successful = True
+                    torch.save(model.state_dict(), optimized_model_path_fold)
+                    print(f"  -> Fold {fold_id} Val Improved! Saving OPTIMIZED model.")
                 except Exception as e:
-                    print(f"  -> Error saving fine-tuned model for fold {fold_id}: {e}")
+                    print(f"  -> Error saving model: {e}")
                 not_improved_count = 0
             else:
                 not_improved_count += 1
+                print(f"  -> Val not improved. Count: {not_improved_count}/{PATIENCE}")
+
+            try:
+                torch.save(model.state_dict(), force_save_path_fold)
+            except Exception as e:
+                print(f"Error saving forced model: {e}")
 
             if not_improved_count >= PATIENCE:
                 print(
                     f"\nEarly stopping at Epoch {epoch} for fold {fold_id}.")
                 break
 
-        if fine_tuning_successful:
-            final_model_paths_for_folds.append(causal_model_path_fold)
-            print(f"Fold {fold_id} fine-tuning finished. Using {os.path.basename(causal_model_path_fold)}.")
+        if os.path.exists(optimized_model_path_fold):
+            final_model_paths_for_folds.append(optimized_model_path_fold)
+            print(f"Fold {fold_id} fine-tuning finished. Using Optimized Model (Best Val).")
+        elif os.path.exists(force_save_path_fold):
+            final_model_paths_for_folds.append(force_save_path_fold)
+            print(f"Fold {fold_id} fine-tuning finished. Using Forced Model (Last Epoch).")
         else:
-            final_model_paths_for_folds.append(model_path)  # reverts to pre-trained
-            print(f"Fold {fold_id} fine-tuning finished. No improvement, reverting to {os.path.basename(model_path)}.")
+            final_model_paths_for_folds.append(model_path)
+            print(f"Fold {fold_id} fine-tuning finished. No new model saved, reverting to pre-trained.")
+
 
     print("\n--- Starting final evaluation on the unseen global test set ---")
 
