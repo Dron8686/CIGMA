@@ -10,6 +10,8 @@ import os
 from torch.utils.data import DataLoader, TensorDataset, Subset, random_split
 import warnings
 import math
+from collections import Counter
+
 warnings.filterwarnings("ignore")
 
 
@@ -48,7 +50,8 @@ def _get_feed_dict(data, feature_index, drug_neighbor_set, symptom_neighbor_set,
     except StopIteration:
         raise ValueError("Neighbor set appears valid but contains no actual entries.")
     except TypeError as e:
-        print(f"Error accessing neighbor set depth: {e}"); raise
+        print(f"Error accessing neighbor set depth: {e}");
+        raise
     if model_n_hop > drug_set_depth: raise ValueError(
         f"Model requires n_hop={model_n_hop}, but drug_neighbor_set only has depth {drug_set_depth}.")
     if model_n_hop > sym_set_depth: raise ValueError(
@@ -61,9 +64,11 @@ def _get_feed_dict(data, feature_index, drug_neighbor_set, symptom_neighbor_set,
             drugs_neighbors.append(torch.LongTensor(drugs_neighbors_batch).to(device))
             symptoms_neighbors.append(torch.LongTensor(symptoms_neighbors_batch).to(device))
         except KeyError as e:
-            print(f"Error: Missing key {e} in neighbor set."); raise
+            print(f"Error: Missing key {e} in neighbor set.");
+            raise
         except Exception as e:
-            print(f"Unexpected error creating neighbor tensors at hop {hop}: {e}"); raise
+            print(f"Unexpected error creating neighbor tensors at hop {hop}: {e}");
+            raise
 
     drug_feat = torch.LongTensor(list(drug_neighbor_set.keys())).to(device)
     sym_feat = torch.LongTensor(list(symptom_neighbor_set.keys())).to(device)
@@ -128,9 +133,11 @@ if __name__ == '__main__':
         with open('../data/node_map_dict.pickle', "rb") as f:
             node_map_dict = pickle.load(f)
     except FileNotFoundError as e:
-        print(f"Error loading essential data file: {e}."); exit()
+        print(f"Error loading essential data file: {e}.");
+        exit()
     except Exception as e:
-        print(f"Error during pickle file loading: {e}"); exit()
+        print(f"Error during pickle file loading: {e}");
+        exit()
 
     dic_ids_sym = {};
     dic_ids_drug = {};
@@ -146,17 +153,21 @@ if __name__ == '__main__':
         edge_index_df = pd.read_csv(args.data_dir + '/train_edge_index.txt', sep=',')
         edge_index = edge_index_df.values.astype(int)
     except FileNotFoundError as e:
-        print(f"Error loading data loader or edge index file: {e}."); exit()
+        print(f"Error loading data loader or edge index file: {e}.");
+        exit()
     except Exception as e:
-        print(f"Error during data loader/edge index loading: {e}"); exit()
+        print(f"Error during data loader/edge index loading: {e}");
+        exit()
 
     try:
         edge_index = edge_index[edge_index[:, -1] == 1][:, :-1]
         edge_index[:, 1] = edge_index[:, 1] + node_num_dict.get('drug', 0)
     except IndexError as e:
-        print(f"Error processing edge_index array: {e}. Shape incorrect."); exit()
+        print(f"Error processing edge_index array: {e}. Shape incorrect.");
+        exit()
     except KeyError as e:
-        print(f"Error processing edge_index: Missing key {e} in node_num_dict."); exit()
+        print(f"Error processing edge_index: Missing key {e} in node_num_dict.");
+        exit()
 
     print("Initializing and loading the pre-trained model...")
     try:
@@ -166,7 +177,8 @@ if __name__ == '__main__':
                             emb_dim=args.emb_dim, n_hop=args.n_hop_model,
                             l1_decay=args.l1_decay).to(device)
     except KeyError as e:
-        print(f"Error initializing model: Missing key {e} in node_num_dict."); exit()
+        print(f"Error initializing model: Missing key {e} in node_num_dict.");
+        exit()
 
     model_path = os.path.join(args.save_dir, 'best_model_indep.pth')
     if not os.path.exists(model_path):
@@ -179,7 +191,6 @@ if __name__ == '__main__':
         print(f"Error loading pre-trained model weights: {e}")
         exit()
 
-
     print("\nEvaluating Pre-trained Model on the Test Set (Before Fine-tuning)")
     metrics_test_initial = evaluate_model(model, test_data_loader, feature_index, drug_neighbor_set,
                                           symptom_neighbor_set, edge_index, device)
@@ -188,12 +199,13 @@ if __name__ == '__main__':
 
     print("\nStarting Causal Invariant Fine-tuning...")
 
-    FINETUNE_EPOCHS = 50
-    LEARNING_RATE = 0.0001
-    IRM_LAMBDA = 0.5
+    FINETUNE_EPOCHS = 60
+    LEARNING_RATE = 5e-6
+    IRM_LAMBDA = 1e-5
+    PATIENCE = 30
+
     BATCH_SIZE = full_train_loader.batch_size if full_train_loader.batch_size is not None else 64
     VALIDATION_SPLIT = 0.1
-    PATIENCE = 10
     not_improved_count = 0
 
     full_train_dataset = full_train_loader.dataset
@@ -216,17 +228,41 @@ if __name__ == '__main__':
                 print("Warning: Not enough fine-tuning samples to create 2 IRM environments. Skipping fine-tuning.")
                 final_model_path = model_path
             else:
-                env_indices = list(range(len(train_subset)))
-                random.shuffle(env_indices)
-                split_point = len(env_indices) // 2
-                env1_indices, env2_indices = env_indices[:split_point], env_indices[split_point:]
+                print("Generating environments based on Node Degree (Popularity) for Balanced Split...")
+
+                temp_loader = DataLoader(train_subset, batch_size=len(train_subset), shuffle=False)
+                all_data_tensor, _ = next(iter(temp_loader))
+
+                train_drug_indices = all_data_tensor[:, feature_index['drug']].cpu().numpy()
+                train_symptom_indices = all_data_tensor[:, feature_index['symptom']].cpu().numpy()
+
+                drug_counts = Counter(train_drug_indices)
+                sym_counts = Counter(train_symptom_indices)
+
+                sample_scores = []
+                for i in range(len(train_drug_indices)):
+                    d_id = train_drug_indices[i]
+                    s_id = train_symptom_indices[i]
+                    score = drug_counts[d_id] + sym_counts[s_id]
+                    sample_scores.append(score)
+
+                sample_scores = np.array(sample_scores)
+                sorted_indices_local = np.argsort(sample_scores)
+                split_point = len(sorted_indices_local) // 2
+
+                env1_indices = sorted_indices_local[:split_point].tolist()
+                env2_indices = sorted_indices_local[split_point:].tolist()
+
+                print(
+                    f"Degree-based Split Successful (Median Cut) - Env1 (Tail): {len(env1_indices)}, Env2 (Head): {len(env2_indices)}")
+
+
                 if not env1_indices or not env2_indices:
                     print("Warning: Could not create two non-empty IRM environments. Skipping fine-tuning.")
                     final_model_path = model_path
                 else:
                     env1_loader = DataLoader(Subset(train_subset, env1_indices), batch_size=BATCH_SIZE, shuffle=True)
                     env2_loader = DataLoader(Subset(train_subset, env2_indices), batch_size=BATCH_SIZE, shuffle=True)
-                    print(f"Created 2 environments for IRM with {len(env1_indices)} and {len(env2_indices)} samples.")
 
                     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
                     loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -239,6 +275,12 @@ if __name__ == '__main__':
                         f"Baseline performance on new validation set: AUPR={metrics_valid_baseline[0]:.4f}, AUC={metrics_valid_baseline[1]:.4f}")
 
                     fine_tuning_successful = False
+
+                    optimized_model_path = os.path.join(args.save_dir, 'best_model_DELTA_GA_optimized.pth')
+                    force_save_path = os.path.join(args.save_dir, 'best_model_DELTA_GA_forced.pth')
+
+                    if os.path.exists(optimized_model_path): os.remove(optimized_model_path)
+
                     for epoch in range(1, FINETUNE_EPOCHS + 1):
                         model.train()
                         iter1, iter2 = iter(env1_loader), iter(env2_loader)
@@ -262,7 +304,6 @@ if __name__ == '__main__':
                                                     edge_index, model.n_hop, device))
                                 loss2 = loss_fn(logits2, target2)
 
-
                                 dummy_w = torch.tensor(1.0, device=device).requires_grad_()
                                 grad1 = \
                                 torch.autograd.grad(loss_fn(logits1 * dummy_w, target1), [dummy_w], create_graph=True)[
@@ -284,7 +325,6 @@ if __name__ == '__main__':
                                 continue
 
                         if batch_count == 0:
-                            print(f"Epoch {epoch}: No successful batches during fine-tuning. Skipping validation.")
                             continue
 
                         metrics_valid = evaluate_model(model, finetune_valid_loader, feature_index, drug_neighbor_set,
@@ -299,31 +339,28 @@ if __name__ == '__main__':
 
                         if current_valid_metric > best_valid_metric:
                             best_valid_metric = current_valid_metric
-                            causal_model_path = os.path.join(args.save_dir, 'best_model_DELTA_GA_optimized.pth')
-                            try:
-                                torch.save(model.state_dict(), causal_model_path)
-                                print(
-                                    f"  -> Found better model! Val Performance improved to {best_valid_metric:.4f}. Model saved.")
-                                fine_tuning_successful = True  # Mark that we saved at least one improved model
-                            except Exception as e:
-                                print(f"  -> Error saving fine-tuned model at epoch {epoch}: {e}")
                             not_improved_count = 0
+                            torch.save(model.state_dict(), optimized_model_path)
+                            print(f"  -> Val Improved! Saving OPTIMIZED model.")
                         else:
                             not_improved_count += 1
-                            print(f"  -> Performance did not improve. Count: {not_improved_count}/{PATIENCE}")
+                            print(f"  -> Val not improved. Count: {not_improved_count}/{PATIENCE}")
+
+                        torch.save(model.state_dict(), force_save_path)
 
                         if not_improved_count >= PATIENCE:
-                            print(
-                                f"\nEarly stopping at Epoch {epoch} as validation metric did not improve for {PATIENCE} epochs.")
+                            print(f"\nEarly stopping at Epoch {epoch}.")
                             break
 
-                    if fine_tuning_successful:
-                        final_model_path = causal_model_path
-                        print("\nCausal Fine-tuning finished. Best fine-tuned model selected.")
+                    if os.path.exists(optimized_model_path):
+                        final_model_path = optimized_model_path
+                        print(f"\n[Success] Found Optimized Model (Best Val Performance). Using it for testing.")
+                    elif os.path.exists(force_save_path):
+                        final_model_path = force_save_path
+                        print(f"\n[Warning] No Val improvement. Using Forced Model (Last Epoch) for testing.")
                     else:
                         final_model_path = model_path
-                        print("\nCausal Fine-tuning finished. No improvement over pre-trained model.")
-
+                        print(f"[Failure] Fine-tuning failed completely. Reverting to pre-trained.")
 
     print("\n--- Starting final evaluation on the unseen test set (Using selected model) ---")
 
@@ -339,12 +376,10 @@ if __name__ == '__main__':
         exit()
     model.eval()
 
-
     test_preds, test_targets, test_embeds = [], [], []
     all_att_syms_batches, all_att_drugs_batches = [], []
     symptoms_neighborss_batches, drugs_neighborss_batches = [], []
     symptomss, drugss = [], []
-
 
     if len(test_data_loader) == 0:
         print("Warning: Test data loader is empty. Cannot perform final evaluation.")
@@ -363,7 +398,6 @@ if __name__ == '__main__':
                     test_preds.extend(pred.cpu().numpy())
                     test_targets.extend(target.cpu().numpy())
                     test_embeds.extend(embeds.cpu().numpy())
-
 
                     if att_sym_list: all_att_syms_batches.append(att_sym_list[0].cpu().numpy())
                     if att_drug_list: all_att_drugs_batches.append(att_drug_list[0].cpu().numpy())
